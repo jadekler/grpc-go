@@ -230,7 +230,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 			return nil, err
 		}
 
-		s, err = t.NewStream(ctx, callHdr)
+		s, err = t.NewStream(ctx, callHdr, c.callMetadata)
 		if err != nil {
 			if done != nil {
 				doneInfo := balancer.DoneInfo{Err: err}

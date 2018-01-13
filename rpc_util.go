@@ -130,10 +130,11 @@ type callInfo struct {
 	maxReceiveMessageSize *int
 	maxSendMessageSize    *int
 	creds                 credentials.PerRPCCredentials
+	callMetadata          metadata.MD
 }
 
 func defaultCallInfo() *callInfo {
-	return &callInfo{failFast: true}
+	return &callInfo{failFast: true, callMetadata: metadata.MD{}}
 }
 
 // CallOption configures a Call before it starts or extracts information from
@@ -165,6 +166,15 @@ type afterCall func(c *callInfo)
 
 func (o afterCall) before(c *callInfo) error { return nil }
 func (o afterCall) after(c *callInfo)        { o(c) }
+
+// CallMetadata returns a CallOption that will attach the given metadata
+// to the call headers.
+func CallMetadata(k, v string) CallOption {
+	return beforeCall(func(c *callInfo) error {
+		c.callMetadata[k] = append(c.callMetadata[k], v)
+		return nil
+	})
+}
 
 // Header returns a CallOptions that retrieves the header metadata
 // for a unary RPC.

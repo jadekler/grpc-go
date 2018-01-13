@@ -2574,11 +2574,12 @@ func testPeerFailedRPC(t *testing.T, e env) {
 func TestMetadataUnaryRPC(t *testing.T) {
 	defer leakcheck.Check(t)
 	for _, e := range listTestEnv() {
-		testMetadataUnaryRPC(t, e)
+		testContextMetadataUnaryRPC(t, e)
+		testCallOptMetadataUnaryRPC(t, e)
 	}
 }
 
-func testMetadataUnaryRPC(t *testing.T, e env) {
+func testContextMetadataUnaryRPC(t *testing.T, e env) {
 	te := newTest(t, e)
 	te.startServer(&testServer{security: e.security})
 	defer te.tearDown()
@@ -2613,6 +2614,49 @@ func testMetadataUnaryRPC(t *testing.T, e env) {
 	}
 	if !reflect.DeepEqual(trailer, testTrailerMetadata) {
 		t.Fatalf("Received trailer metadata %v, want %v", trailer, testTrailerMetadata)
+	}
+}
+
+func testCallOptMetadataUnaryRPC(t *testing.T, e env) {
+	te := newTest(t, e)
+	te.startServer(&testServer{security: e.security})
+	defer te.tearDown()
+	tc := testpb.NewTestServiceClient(te.clientConn())
+
+	const argSize = 2718
+	const respSize = 314
+
+	payload, err := newPayload(testpb.PayloadType_COMPRESSABLE, argSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &testpb.SimpleRequest{
+		ResponseType: testpb.PayloadType_COMPRESSABLE,
+		ResponseSize: respSize,
+		Payload:      payload,
+	}
+
+	opts := []grpc.CallOption{}
+	for k, vv := range testMetadata {
+		for _, v := range vv {
+			opts = append(opts, grpc.CallMetadata(k, v))
+		}
+	}
+
+	ctx := context.Background()
+	var header metadata.MD
+	if _, err := tc.UnaryCall(ctx, req, append(opts, grpc.Header(&header))...); err != nil {
+		t.Fatalf("TestService.UnaryCall(%v, _, _, _) = _, %v; want _, <nil>", ctx, err)
+	}
+	// Ignore optional response headers that Servers may set:
+	if header != nil {
+		delete(header, "trailer") // RFC 2616 says server SHOULD (but optional) declare trailers
+		delete(header, "date")    // the Date header is also optional
+		delete(header, "user-agent")
+	}
+	if !reflect.DeepEqual(header, testMetadata) {
+		t.Fatalf("Received header metadata %v, want %v", header, testMetadata)
 	}
 }
 

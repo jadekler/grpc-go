@@ -572,7 +572,7 @@ type ClientTransport interface {
 	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
 
 	// NewStream creates a Stream for an RPC.
-	NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error)
+	NewStream(ctx context.Context, callHdr *CallHdr, md metadata.MD) (*Stream, error)
 
 	// CloseStream clears the footprint of a stream when the stream is
 	// not needed any more. The err indicates the error incurred when

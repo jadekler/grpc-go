@@ -252,7 +252,7 @@ func invoke(ctx context.Context, method string, args, reply interface{}, cc *Cli
 		if err != nil {
 			return err
 		}
-		stream, err := t.NewStream(ctx, callHdr)
+		stream, err := t.NewStream(ctx, callHdr, c.callMetadata)
 		if err != nil {
 			if done != nil {
 				done(balancer.DoneInfo{Err: err})
