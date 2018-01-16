@@ -2637,16 +2637,17 @@ func testCallOptMetadataUnaryRPC(t *testing.T, e env) {
 		Payload:      payload,
 	}
 
-	opts := []grpc.CallOption{}
+	pairs := []string{}
 	for k, vv := range testMetadata {
 		for _, v := range vv {
-			opts = append(opts, grpc.CallMetadata(k, v))
+			pairs = append(pairs, k)
+			pairs = append(pairs, v)
 		}
 	}
 
 	ctx := context.Background()
 	var header metadata.MD
-	if _, err := tc.UnaryCall(ctx, req, append(opts, grpc.Header(&header))...); err != nil {
+	if _, err := tc.UnaryCall(ctx, req, grpc.CallMetadataPairs(pairs...), grpc.Header(&header)); err != nil {
 		t.Fatalf("TestService.UnaryCall(%v, _, _, _) = _, %v; want _, <nil>", ctx, err)
 	}
 	// Ignore optional response headers that Servers may set:

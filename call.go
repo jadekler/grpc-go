@@ -223,8 +223,9 @@ func invoke(ctx context.Context, method string, args, reply interface{}, cc *Cli
 		Delay: false,
 	}
 	callHdr := &transport.CallHdr{
-		Host:   cc.authority,
-		Method: method,
+		Host:           cc.authority,
+		Method:         method,
+		CustomMetadata: c.callMetadata,
 	}
 	if c.creds != nil {
 		callHdr.Creds = c.creds
@@ -252,7 +253,7 @@ func invoke(ctx context.Context, method string, args, reply interface{}, cc *Cli
 		if err != nil {
 			return err
 		}
-		stream, err := t.NewStream(ctx, callHdr, c.callMetadata)
+		stream, err := t.NewStream(ctx, callHdr)
 		if err != nil {
 			if done != nil {
 				done(balancer.DoneInfo{Err: err})

@@ -353,7 +353,7 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *Stream {
 
 // NewStream creates a stream and registers it into the transport as "active"
 // streams.
-func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, md metadata.MD) (_ *Stream, err error) {
+func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Stream, err error) {
 	pr := &peer.Peer{
 		Addr: t.remoteAddr,
 	}
@@ -464,13 +464,18 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, md metada
 		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-trace-bin", Value: encodeBinHeader(b)})
 	}
 
-	for k, vv := range md {
-		// HTTP doesn't allow you to set pseudoheaders after non pseudoheaders were set.
-		if isReservedHeader(k) {
-			continue
-		}
-		for _, v := range vv {
-			headerFields = append(headerFields, hpack.HeaderField{Name: k, Value: encodeMetadataHeader(k, v)})
+	var k string
+	for _, kv := range callHdr.CustomMetadata {
+		for i, s := range kv {
+			if i%2 == 0 {
+				k = s
+				// HTTP doesn't allow you to set pseudoheaders after non pseudoheaders were set.
+				if isReservedHeader(k) {
+					i += 1
+				}
+				continue
+			}
+			headerFields = append(headerFields, hpack.HeaderField{Name: k, Value: encodeMetadataHeader(k, s)})
 		}
 	}
 	if ctxmd, ok := metadata.FromOutgoingContext(ctx); ok {

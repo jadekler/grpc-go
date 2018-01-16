@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
@@ -130,11 +131,11 @@ type callInfo struct {
 	maxReceiveMessageSize *int
 	maxSendMessageSize    *int
 	creds                 credentials.PerRPCCredentials
-	callMetadata          metadata.MD
+	callMetadata          [][]string
 }
 
 func defaultCallInfo() *callInfo {
-	return &callInfo{failFast: true, callMetadata: metadata.MD{}}
+	return &callInfo{failFast: true}
 }
 
 // CallOption configures a Call before it starts or extracts information from
@@ -168,10 +169,15 @@ func (o afterCall) before(c *callInfo) error { return nil }
 func (o afterCall) after(c *callInfo)        { o(c) }
 
 // CallMetadata returns a CallOption that will attach the given metadata
-// to the call headers.
-func CallMetadata(k, v string) CallOption {
+// to the call headers. Metadata should be given as a list of key,value
+// pairs. Multiple values to a single key should be given as k1,v1,k1,v2.
+func CallMetadataPairs(kv ...string) CallOption {
+	if len(kv)%2 == 1 {
+		grpclog.Fatalf("CallMetadataPairs got the odd number of input pairs for metadata: %d", len(kv))
+	}
+
 	return beforeCall(func(c *callInfo) error {
-		c.callMetadata[k] = append(c.callMetadata[k], v)
+		c.callMetadata = append(c.callMetadata, kv)
 		return nil
 	})
 }

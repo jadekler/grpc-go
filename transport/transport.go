@@ -553,6 +553,10 @@ type CallHdr struct {
 	// for performance purposes.
 	// If it's false, new stream will never be flushed.
 	Flush bool
+
+	// CustomMetadata is an arbitrary set of key-value pairs that
+	// are added to call headers.
+	CustomMetadata [][]string
 }
 
 // ClientTransport is the common interface for all gRPC client-side transport
@@ -572,7 +576,7 @@ type ClientTransport interface {
 	Write(s *Stream, hdr []byte, data []byte, opts *Options) error
 
 	// NewStream creates a Stream for an RPC.
-	NewStream(ctx context.Context, callHdr *CallHdr, md metadata.MD) (*Stream, error)
+	NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error)
 
 	// CloseStream clears the footprint of a stream when the stream is
 	// not needed any more. The err indicates the error incurred when
