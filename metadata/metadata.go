@@ -113,26 +113,56 @@ type mdOutgoingKey struct{}
 
 // NewIncomingContext creates a new context with incoming md attached.
 func NewIncomingContext(ctx context.Context, md MD) context.Context {
-	return context.WithValue(ctx, mdIncomingKey{}, md)
+	return context.WithValue(ctx, mdIncomingKey{}, []MD{md})
 }
 
 // NewOutgoingContext creates a new context with outgoing md attached.
 func NewOutgoingContext(ctx context.Context, md MD) context.Context {
-	return context.WithValue(ctx, mdOutgoingKey{}, md)
+	return context.WithValue(ctx, mdOutgoingKey{}, []MD{md})
+}
+
+// AppendToOutgoingContext returns a new context with outgoing md attached
+func AppendToOutgoingContext(ctx context.Context, md MD) context.Context {
+	mds, _ := ctx.Value(mdOutgoingKey{}).([]MD)
+	mds = append(mds, md)
+	ctx2 := context.WithValue(ctx, mdOutgoingKey{}, mds)
+	return ctx2
 }
 
 // FromIncomingContext returns the incoming metadata in ctx if it exists.  The
 // returned MD should not be modified. Writing to it may cause races.
 // Modification should be made to copies of the returned MD.
-func FromIncomingContext(ctx context.Context) (md MD, ok bool) {
-	md, ok = ctx.Value(mdIncomingKey{}).(MD)
+func FromIncomingContext(ctx context.Context) (out MD, ok bool) {
+	mds, ok := ctx.Value(mdIncomingKey{}).([]MD)
+	if !ok {
+		return
+	}
+
+	out = MD{}
+	for _, md := range mds {
+		for k, v := range md {
+			out[k] = append(out[k], v...)
+		}
+	}
+
 	return
 }
 
 // FromOutgoingContext returns the outgoing metadata in ctx if it exists.  The
 // returned MD should not be modified. Writing to it may cause races.
 // Modification should be made to the copies of the returned MD.
-func FromOutgoingContext(ctx context.Context) (md MD, ok bool) {
-	md, ok = ctx.Value(mdOutgoingKey{}).(MD)
+func FromOutgoingContext(ctx context.Context) (out MD, ok bool) {
+	mds, ok := ctx.Value(mdOutgoingKey{}).([]MD)
+	if !ok {
+		return
+	}
+
+	out = MD{}
+	for _, md := range mds {
+		for k, v := range md {
+			out[k] = append(out[k], v...)
+		}
+	}
+
 	return
 }
