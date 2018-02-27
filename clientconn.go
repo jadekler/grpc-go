@@ -43,6 +43,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/transport"
+	"sync/atomic"
 )
 
 var (
@@ -402,12 +403,16 @@ func Dial(target string, opts ...DialOption) (*ClientConn, error) {
 // https://github.com/grpc/grpc/blob/master/doc/naming.md.
 // e.g. to use dns resolver, a "dns:///" prefix should be applied to the target.
 func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *ClientConn, err error) {
+	rpcCtx, rpcCancel := context.WithCancel(context.Background())
 	cc := &ClientConn{
 		target: target,
 		csMgr:  &connectivityStateManager{},
 		conns:  make(map[*addrConn]struct{}),
 
 		blockingpicker: newPickerWrapper(),
+
+		rpcCtx:    rpcCtx,
+		rpcCancel: rpcCancel,
 	}
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
@@ -614,6 +619,12 @@ type ClientConn struct {
 	preBalancerName string // previous balancer name.
 	curAddresses    []resolver.Address
 	balancerWrapper *ccBalancerWrapper
+
+	// TODO: is there a nicer way to do this that doesn't involve
+	// using channels (via context)?
+	rpcCtx          context.Context
+	rpcCancel       context.CancelFunc
+	outstandingRpcs int64
 }
 
 // WaitForStateChange waits until the connectivity.State of ClientConn changes from sourceState or
@@ -953,6 +964,29 @@ func (cc *ClientConn) Close() error {
 		ac.tearDown(ErrClientConnClosing)
 	}
 	return nil
+}
+
+func (cc *ClientConn) recordOpenRpc() {
+	fmt.Println("open!")
+	atomic.AddInt64(&cc.outstandingRpcs, 1)
+}
+
+func (cc *ClientConn) recordCloseRpc() {
+	fmt.Println("close!")
+	atomic.AddInt64(&cc.outstandingRpcs, -1)
+}
+
+func (cc *ClientConn) GracefulShutdown() error {
+	cc.rpcCancel()
+
+	// TODO: what's the proper way to wait for a group to be done, where
+	// the group size is variable up until a certain time?
+	for {
+		if cc.outstandingRpcs == 0 {
+			return cc.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // addrConn is a network connection to a given address.
