@@ -969,25 +969,38 @@ func (cc *ClientConn) Close() error {
 }
 
 func (cc *ClientConn) recordOpenRpc() {
+	//fmt.Println("open rpc!")
 	atomic.AddInt64(&cc.outstandingRpcs, 1)
+	//fmt.Println(cc.outstandingRpcs)
 }
 
 func (cc *ClientConn) recordCloseRpc() {
-	if n := atomic.AddInt64(&cc.outstandingRpcs, -1); n == 0 {
+	//fmt.Println("close rpc!")
+
+	// we don't care about 0: someone did open (+1) -> close (-1), since we have no reason
+	// to inform gracefulShutdown of a shutdown (clearly no one called gracefulShutdown if
+	// the value is < 1)
+	// we only care about 1: someone did open (+1) -> gracefulShutdown (+1) -> close (-1)
+	if n := atomic.AddInt64(&cc.outstandingRpcs, -1); n == 1 {
+		//fmt.Println("yup zero value")
 		select {
 		case <-cc.rpcCtx.Done():
-			close(cc.waitForOutstandingRpcs)
+			cc.waitForOutstandingRpcs <- struct{}{}
 		default:
 		}
 	}
+	//fmt.Println(cc.outstandingRpcs)
 }
 
 func (cc *ClientConn) GracefulShutdown() {
 	cc.rpcCancel()
-	if n := atomic.AddInt64(&cc.outstandingRpcs, 1); n != 1 {
+	if n := atomic.AddInt64(&cc.outstandingRpcs, 1); n > 1 {
+		// we can never get zero (assuming this value never goes below 0)
 		// only reason we would get 1 is if there were no open RPCs, which
-		// means we can quit immediately
+		// means we can quit immediately anyway
+		//fmt.Println("waiting")
 		<-cc.waitForOutstandingRpcs
+		//fmt.Println("done waiting")
 	}
 }
 
