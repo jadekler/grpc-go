@@ -411,8 +411,9 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 
 		blockingpicker: newPickerWrapper(),
 
-		rpcCtx:    rpcCtx,
-		rpcCancel: rpcCancel,
+		rpcCtx:                 rpcCtx,
+		rpcCancel:              rpcCancel,
+		waitForOutstandingRpcs: make(chan struct{}),
 	}
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
@@ -621,10 +622,11 @@ type ClientConn struct {
 	balancerWrapper *ccBalancerWrapper
 
 	// TODO: is there a nicer way to do this that doesn't involve
-	// using channels (via context)?
-	rpcCtx          context.Context
-	rpcCancel       context.CancelFunc
-	outstandingRpcs int64
+	// using channels (chan struct, context)?
+	rpcCtx                 context.Context
+	rpcCancel              context.CancelFunc
+	waitForOutstandingRpcs chan struct{}
+	outstandingRpcs        int64
 }
 
 // WaitForStateChange waits until the connectivity.State of ClientConn changes from sourceState or
@@ -967,25 +969,25 @@ func (cc *ClientConn) Close() error {
 }
 
 func (cc *ClientConn) recordOpenRpc() {
-	fmt.Println("open!")
 	atomic.AddInt64(&cc.outstandingRpcs, 1)
 }
 
 func (cc *ClientConn) recordCloseRpc() {
-	fmt.Println("close!")
-	atomic.AddInt64(&cc.outstandingRpcs, -1)
+	if n := atomic.AddInt64(&cc.outstandingRpcs, -1); n == 0 {
+		select {
+		case <-cc.rpcCtx.Done():
+			close(cc.waitForOutstandingRpcs)
+		default:
+		}
+	}
 }
 
-func (cc *ClientConn) GracefulShutdown() error {
+func (cc *ClientConn) GracefulShutdown() {
 	cc.rpcCancel()
-
-	// TODO: what's the proper way to wait for a group to be done, where
-	// the group size is variable up until a certain time?
-	for {
-		if cc.outstandingRpcs == 0 {
-			return cc.Close()
-		}
-		time.Sleep(100 * time.Millisecond)
+	if n := atomic.AddInt64(&cc.outstandingRpcs, 1); n != 1 {
+		// only reason we would get 1 is if there were no open RPCs, which
+		// means we can quit immediately
+		<-cc.waitForOutstandingRpcs
 	}
 }
 
