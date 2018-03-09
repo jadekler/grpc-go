@@ -43,6 +43,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/transport"
+	"sync/atomic"
 )
 
 var (
@@ -403,11 +404,11 @@ func Dial(target string, opts ...DialOption) (*ClientConn, error) {
 // e.g. to use dns resolver, a "dns:///" prefix should be applied to the target.
 func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *ClientConn, err error) {
 	cc := &ClientConn{
-		target: target,
-		csMgr:  &connectivityStateManager{},
-		conns:  make(map[*addrConn]struct{}),
-
-		blockingpicker: newPickerWrapper(),
+		target:                 target,
+		csMgr:                  &connectivityStateManager{},
+		conns:                  make(map[*addrConn]struct{}),
+		blockingpicker:         newPickerWrapper(),
+		waitForOutstandingRpcs: make(chan struct{}),
 	}
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
@@ -614,6 +615,12 @@ type ClientConn struct {
 	preBalancerName string // previous balancer name.
 	curAddresses    []resolver.Address
 	balancerWrapper *ccBalancerWrapper
+
+	// TODO: is there a nicer way to do this that doesn't involve
+	// using channels (chan struct, context)?
+	rpcState               int32 // 0 = accepting new conns, 1 = gracefully closing
+	waitForOutstandingRpcs chan struct{}
+	outstandingRpcs        sync.WaitGroup
 }
 
 // WaitForStateChange waits until the connectivity.State of ClientConn changes from sourceState or
@@ -953,6 +960,28 @@ func (cc *ClientConn) Close() error {
 		ac.tearDown(ErrClientConnClosing)
 	}
 	return nil
+}
+
+func (cc *ClientConn) recordOpenRpc() {
+	//fmt.Println("open rpc!")
+	cc.outstandingRpcs.Add(1)
+	//fmt.Println(cc.outstandingRpcs)
+}
+
+func (cc *ClientConn) recordCloseRpc() {
+	//fmt.Println("close rpc!")
+
+	// we don't care about 0: someone did open (+1) -> close (-1), since we have no reason
+	// to inform gracefulShutdown of a shutdown (clearly no one called gracefulShutdown if
+	// the value is < 1)
+	// we only care about 1: someone did open (+1) -> gracefulShutdown (+1) -> close (-1)
+	cc.outstandingRpcs.Done()
+	//fmt.Println(cc.outstandingRpcs)
+}
+
+func (cc *ClientConn) GracefulShutdown() {
+	atomic.SwapInt32(&cc.rpcState, 1)
+	cc.outstandingRpcs.Wait()
 }
 
 // addrConn is a network connection to a given address.
