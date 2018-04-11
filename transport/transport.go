@@ -520,8 +520,8 @@ type TargetInfo struct {
 
 // NewClientTransport establishes the transport with the required ConnectOptions
 // and returns it to the caller.
-func NewClientTransport(connectCtx, ctx context.Context, target TargetInfo, opts ConnectOptions, onSuccess func()) (ClientTransport, error) {
-	return newHTTP2Client(connectCtx, ctx, target, opts, onSuccess)
+func NewClientTransport(connectCtx, ctx context.Context, target TargetInfo, opts ConnectOptions, onSuccess, onGoAway func(), onShutdown func(error), acTrId int32) (ClientTransport, error) {
+	return newHTTP2Client(connectCtx, ctx, target, opts, onSuccess, onGoAway, onShutdown, acTrId)
 }
 
 // Options provides additional hints and information for message
@@ -593,18 +593,6 @@ type ClientTransport interface {
 	// CloseStream is called. Must be called when a stream is finished
 	// unless the associated transport is closing.
 	CloseStream(stream *Stream, err error)
-
-	// Error returns a channel that is closed when some I/O error
-	// happens. Typically the caller should have a goroutine to monitor
-	// this in order to take action (e.g., close the current transport
-	// and create a new one) in error case. It should not return nil
-	// once the transport is initiated.
-	Error() <-chan struct{}
-
-	// GoAway returns a channel that is closed when ClientTransport
-	// receives the draining signal from the server (e.g., GOAWAY frame in
-	// HTTP/2).
-	GoAway() <-chan struct{}
 
 	// GetGoAwayReason returns the reason why GoAway frame was received.
 	GetGoAwayReason() GoAwayReason

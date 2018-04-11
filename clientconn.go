@@ -43,6 +43,7 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/transport"
+	"sync/atomic"
 )
 
 const (
@@ -792,9 +793,10 @@ func (cc *ClientConn) handleSubConnStateChange(sc balancer.SubConn, s connectivi
 // Caller needs to make sure len(addrs) > 0.
 func (cc *ClientConn) newAddrConn(addrs []resolver.Address) (*addrConn, error) {
 	ac := &addrConn{
-		cc:    cc,
-		addrs: addrs,
-		dopts: cc.dopts,
+		cc:         cc,
+		addrs:      addrs,
+		dopts:      cc.dopts,
+		transports: make(map[int32]transport.ClientTransport),
 	}
 	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
 	// Track ac in cc. This needs to be done before any getTransport(...) is called.
@@ -840,6 +842,13 @@ func (ac *addrConn) connect() error {
 	ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
 	ac.mu.Unlock()
 
+	// TODO(deklerk)
+	// DONE pass these closures down to the transport
+	// DONE remove Error and GoAway channels (and from the interface)
+	// DONE where we're calling close(Error) / close(GoAway), instead call closures
+	// DONE synchronize onError and onGoAway
+	// (LATER) wg.Done will happen in onError
+
 	// Start a goroutine connecting to the server asynchronously.
 	go func() {
 		if err := ac.resetTransport(); err != nil {
@@ -850,7 +859,6 @@ func (ac *addrConn) connect() error {
 			}
 			return
 		}
-		ac.transportMonitor()
 	}()
 	return nil
 }
@@ -954,6 +962,26 @@ func (cc *ClientConn) resolveNow(o resolver.ResolveNowOption) {
 func (cc *ClientConn) Close() error {
 	defer cc.cancel()
 
+	// ~~~~~~~~~~~~~~ DONE ~~~~~~~~~~~~~~~~~
+	// TODO(deklerk) kill all transports that cc has with t.Close
+	// there is a case where the GOAWAY causes a transport to be
+	// orphaned. we have to iterate over all transports here, INCL
+	// the orphaned
+	// ACTUALLY
+	// clientConn HAS addrConn HAS transport
+	// when transport is recreated, we lose the link from addrConn to transport (transport gets orphaned)
+	// in the GOAWAY case, that sucks, bc we lose the link but later we
+	// actually need to close all transport (including the orphan)
+	// SO
+	// keep slice of transports in addrConn
+	// when transport.Close is called, remove itself from the slice
+	// when clientConn.Close is called, tell addrConn to close (actually, TEARDOWN)
+	// when addrConn.Close is called, iterate over all transports in the slice (incl closed ones) and tell them to close
+	// ACTUALLY
+	// keep map and increment ID, that way we don't have to register RemoveFromAC closure after the fact (we can send
+	// in an ID in the constructor)
+	// ~~~~~~~~~~~~~~ DONE ~~~~~~~~~~~~~~~~~
+
 	cc.mu.Lock()
 	if cc.conns == nil {
 		cc.mu.Unlock()
@@ -1011,6 +1039,11 @@ type addrConn struct {
 	// connectDeadline is the time by which all connection
 	// negotiations must complete.
 	connectDeadline time.Time
+
+	transportIdCounter int32
+
+	// Open transports, including those orphaned by GOAWAY
+	transports map[int32]transport.ClientTransport
 }
 
 // adjustParams updates parameters used to create transports upon
@@ -1113,6 +1146,22 @@ func (ac *addrConn) resetTransport() error {
 		copy(addrsIter, ac.addrs)
 		copts := ac.dopts.copts
 		ac.mu.Unlock()
+
+		// ~~~~~~~~~~~ DONE ~~~~~~~~~~~~~~~
+		// TODO(deklerk) this is endlessly happening for some reason...??
+		// TODO(deklerk) run this: go test -race -v -count=10 -failfast -run TestOneServerDown
+		// TODO(deklerk) it seems to be always targeting the "down" server instead of
+		// being load balanced to the "up" server. porque??
+		// SO
+		// endless loop: resetTransport -> createTransport -> onShutdown (via transport.NewClientTransport) -> resetTransport
+		// it never gets to tearDown step L1468
+		// CONTEXT
+		// wasn't happening before b/c transportMonitor resetTransport() would fail and then tearDown would immediately
+		// happen
+		// ~~~~~~~~~~~ DONE ~~~~~~~~~~~~~~~
+
+		// TODO(deklerk) so now, reset transport is once again not finishing, but now the reason is unclear.
+		// this whole thing might require a redesign..
 		connected, err := ac.createTransport(connectRetryNum, ridx, backoffDeadline, connectDeadline, addrsIter, copts)
 		if err != nil {
 			return err
@@ -1152,7 +1201,66 @@ func (ac *addrConn) createTransport(connectRetryNum, ridx int, backoffDeadline, 
 		// Do not cancel in the success path because of
 		// this issue in Go1.6: https://github.com/golang/go/issues/15078.
 		connectCtx, cancel := context.WithDeadline(ac.ctx, connectDeadline)
-		newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, target, copts, onPrefaceReceipt)
+
+		newTrId := atomic.AddInt32(&ac.transportIdCounter, 1)
+
+		onDeadlineExpire := func() {
+			ac.mu.Lock()
+
+			if ac.backoffDeadline.IsZero() {
+				ac.mu.Unlock()
+				return
+			}
+			ac.mu.Unlock()
+
+			err := ac.transport.Close()
+			if err != nil {
+				grpclog.Error(err)
+			}
+
+			ac.foo()
+		}
+
+		timer := time.AfterFunc(ac.connectDeadline.Sub(time.Now()), onDeadlineExpire)
+		shutdownLock := &sync.Mutex{}
+
+		onGoAway := func() {
+			shutdownLock.Lock()
+			defer shutdownLock.Unlock()
+
+			if timer != nil {
+				timer.Stop() // TODO(deklerk) should I do the more complicated thing in the timer.Stop doc?
+			}
+			ac.adjustParams(ac.transport.GetGoAwayReason())
+
+			ac.foo()
+		}
+
+		onShutdown := func(err error) {
+			shutdownLock.Lock()
+			defer shutdownLock.Unlock()
+
+			ac.mu.Lock()
+			delete(ac.transports, newTrId)
+			ac.mu.Unlock()
+
+			if timer != nil {
+				timer.Stop() // TODO(deklerk) should I do the more complicated thing in the timer.Stop doc?
+			}
+
+			// TODO(deklerk) do i actually need the following?
+			// In case this is triggered because clientConn.Close()
+			// was called, we want to immediately close the transport
+			// since no other goroutine might notice it for a while.
+			//err := ac.transport.Close()
+			//if err != nil {
+			//	grpclog.Error(err)
+			//}
+
+			ac.foo()
+		}
+
+		newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, target, copts, onPrefaceReceipt, onGoAway, onShutdown, newTrId)
 		if err != nil {
 			cancel()
 			ac.cc.blockingpicker.updateConnectionError(err)
@@ -1187,6 +1295,7 @@ func (ac *addrConn) createTransport(connectRetryNum, ridx int, backoffDeadline, 
 		ac.printf("ready")
 		ac.state = connectivity.Ready
 		ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+		ac.transports[newTrId] = newTr
 		ac.transport = newTr
 		ac.curAddr = addr
 		if ac.ready != nil {
@@ -1196,7 +1305,7 @@ func (ac *addrConn) createTransport(connectRetryNum, ridx int, backoffDeadline, 
 		select {
 		case <-done:
 			// If the server has responded back with preface already,
-			// don't set the reconnect parameters.
+			// don't set the foo parameters.
 		default:
 			ac.connectRetryNum = connectRetryNum
 			ac.backoffDeadline = backoffDeadline
@@ -1223,73 +1332,6 @@ func (ac *addrConn) createTransport(connectRetryNum, ridx int, backoffDeadline, 
 		return false, ac.ctx.Err()
 	}
 	return false, nil
-}
-
-// Run in a goroutine to track the error in transport and create the
-// new transport if an error happens. It returns when the channel is closing.
-func (ac *addrConn) transportMonitor() {
-	for {
-		var timer *time.Timer
-		var cdeadline <-chan time.Time
-		ac.mu.Lock()
-		t := ac.transport
-		if !ac.connectDeadline.IsZero() {
-			timer = time.NewTimer(ac.connectDeadline.Sub(time.Now()))
-			cdeadline = timer.C
-		}
-		ac.mu.Unlock()
-		// Block until we receive a goaway or an error occurs.
-		select {
-		case <-t.GoAway():
-		case <-t.Error():
-		case <-cdeadline:
-			ac.mu.Lock()
-			// This implies that client received server preface.
-			if ac.backoffDeadline.IsZero() {
-				ac.mu.Unlock()
-				continue
-			}
-			ac.mu.Unlock()
-			timer = nil
-			// No server preface received until deadline.
-			// Kill the connection.
-			grpclog.Warningf("grpc: addrConn.transportMonitor didn't get server preface after waiting. Closing the new transport now.")
-			t.Close()
-		}
-		if timer != nil {
-			timer.Stop()
-		}
-		// If a GoAway happened, regardless of error, adjust our keepalive
-		// parameters as appropriate.
-		select {
-		case <-t.GoAway():
-			ac.adjustParams(t.GetGoAwayReason())
-		default:
-		}
-		ac.mu.Lock()
-		if ac.state == connectivity.Shutdown {
-			ac.mu.Unlock()
-			return
-		}
-		// Set connectivity state to TransientFailure before calling
-		// resetTransport. Transition READY->CONNECTING is not valid.
-		ac.state = connectivity.TransientFailure
-		ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
-		ac.cc.resolveNow(resolver.ResolveNowOption{})
-		ac.curAddr = resolver.Address{}
-		ac.mu.Unlock()
-		if err := ac.resetTransport(); err != nil {
-			ac.mu.Lock()
-			ac.printf("transport exiting: %v", err)
-			ac.mu.Unlock()
-			grpclog.Warningf("grpc: addrConn.transportMonitor exits due to: %v", err)
-			if err != errConnClosing {
-				// Keep this ac in cc.conns, to get the reason it's torn down.
-				ac.tearDown(err)
-			}
-			return
-		}
-	}
 }
 
 // wait blocks until i) the new transport is up or ii) ctx is done or iii) ac is closed or
@@ -1326,7 +1368,7 @@ func (ac *addrConn) wait(ctx context.Context, hasBalancer, failfast bool) (trans
 		select {
 		case <-ctx.Done():
 			return nil, toRPCErr(ctx.Err())
-		// Wait until the new transport is ready or failed.
+			// Wait until the new transport is ready or failed.
 		case <-ready:
 		}
 	}
@@ -1351,6 +1393,7 @@ func (ac *addrConn) getReadyTransport() (transport.ClientTransport, bool) {
 	if idle {
 		ac.connect()
 	}
+
 	return nil, false
 }
 
@@ -1361,9 +1404,10 @@ func (ac *addrConn) getReadyTransport() (transport.ClientTransport, bool) {
 // tearDown doesn't remove ac from ac.cc.conns.
 func (ac *addrConn) tearDown(err error) {
 	ac.cancel()
+
 	ac.mu.Lock()
-	defer ac.mu.Unlock()
 	if ac.state == connectivity.Shutdown {
+		ac.mu.Unlock()
 		return
 	}
 	ac.curAddr = resolver.Address{}
@@ -1372,7 +1416,10 @@ func (ac *addrConn) tearDown(err error) {
 		// i) receiving multiple GoAway frames from the server; or
 		// ii) there are concurrent name resolver/Balancer triggered
 		// address removal and GoAway.
+		// TODO(deklerk) is there a way to avoid this unlock -> lock?
+		ac.mu.Unlock()
 		ac.transport.GracefulClose()
+		ac.mu.Lock()
 	}
 	ac.state = connectivity.Shutdown
 	ac.tearDownErr = err
@@ -1385,6 +1432,17 @@ func (ac *addrConn) tearDown(err error) {
 		close(ac.ready)
 		ac.ready = nil
 	}
+
+	// TODO(deklerk) is this bad?
+	transports := map[int32]transport.ClientTransport{}
+	for i, v := range ac.transports { transports[i] = v }
+
+	ac.mu.Unlock()
+
+	for _, t := range transports {
+		t.Close()
+	}
+
 	return
 }
 
@@ -1392,6 +1450,40 @@ func (ac *addrConn) getState() connectivity.State {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 	return ac.state
+}
+
+// Begins reconnect process; returns true if successful or false otherwise.
+func (ac *addrConn) foo() {
+	fmt.Println("reconnecting")
+	ac.mu.Lock()
+	if ac.state == connectivity.Shutdown {
+		//return false ???
+		ac.mu.Unlock()
+		return
+	}
+
+
+	ac.state = connectivity.TransientFailure
+	ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+	ac.cc.resolveNow(resolver.ResolveNowOption{})
+	ac.curAddr = resolver.Address{}
+	ac.mu.Unlock()
+
+	// if, later, after we're connected we see some error/GoAway, we need to behind-the-scenes reconnect
+	if err := ac.resetTransport(); err != nil {
+		fmt.Println("result:", err)
+		ac.mu.Lock()
+		ac.printf("transport exiting: %v", err)
+		ac.mu.Unlock()
+		grpclog.Warningf("grpc: addrConn.transportMonitor exits due to: %v", err)
+		if err != errConnClosing {
+			// Keep this ac in cc.conns, to get the reason it's torn down.
+			ac.tearDown(err)
+		}
+		//return false ???
+	}
+	fmt.Println("result: success")
+	//return true ???
 }
 
 // ErrClientConnTimeout indicates that the ClientConn cannot establish the

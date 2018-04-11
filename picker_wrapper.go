@@ -136,6 +136,7 @@ func (bp *pickerWrapper) pick(ctx context.Context, failfast bool, opts balancer.
 			grpclog.Infof("subconn returned from pick is not *acBalancerWrapper")
 			continue
 		}
+
 		if t, ok := acw.getAddrConn().getReadyTransport(); ok {
 			return t, done, nil
 		}

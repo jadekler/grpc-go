@@ -237,6 +237,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		s    *transport.Stream
 		done func(balancer.DoneInfo)
 	)
+
 	for {
 		// Check to make sure the context has expired.  This will prevent us from
 		// looping forever if an error occurs for wait-for-ready RPCs where no data

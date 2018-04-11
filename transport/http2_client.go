@@ -53,8 +53,7 @@ type http2Client struct {
 	authInfo   credentials.AuthInfo // auth info about the connection
 	nextID     uint32               // the next stream ID to be used
 
-	// goAway is closed to notify the upper layer (i.e., addrConn.transportMonitor)
-	// that the server sent GoAway on this transport.
+	// TODO(deklerk) replace with atomic; now only used to see if multiple goAways occurred
 	goAway chan struct{}
 	// awakenKeepalive is used to wake up keepalive when after it has gone dormant.
 	awakenKeepalive chan struct{}
@@ -111,6 +110,8 @@ type http2Client struct {
 	// goAwayReason records the http2.ErrCode and debug data received with the
 	// GoAway frame.
 	goAwayReason GoAwayReason
+	onGoAway     func()
+	onShutdown   func(error)
 }
 
 func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error), addr string) (net.Conn, error) {
@@ -139,7 +140,7 @@ func isTemporary(err error) bool {
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
-func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts ConnectOptions, onSuccess func()) (_ ClientTransport, err error) {
+func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts ConnectOptions, onSuccess, onGoAway func(), onShutdown func(error), acTrId int32) (_ ClientTransport, err error) {
 	scheme := "http"
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
@@ -228,6 +229,8 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		statsHandler:      opts.StatsHandler,
 		initialWindowSize: initialWindowSize,
 		onSuccess:         onSuccess,
+		onGoAway:          onGoAway,
+		onShutdown:        onShutdown,
 	}
 	if opts.InitialWindowSize >= defaultWindowSize {
 		t.initialWindowSize = opts.InitialWindowSize
@@ -599,6 +602,7 @@ func (t *http2Client) Close() error {
 	t.state = closing
 	t.mu.Unlock()
 	t.cancel()
+
 	err := t.conn.Close()
 	t.mu.Lock()
 	streams := t.activeStreams
@@ -620,6 +624,9 @@ func (t *http2Client) Close() error {
 		}
 		t.statsHandler.HandleConn(t.ctx, connEnd)
 	}
+
+	t.onShutdown(err)
+
 	return err
 }
 
@@ -1041,7 +1048,10 @@ func (t *http2Client) handleGoAway(f *http2.GoAwayFrame) {
 	t.mu.Unlock()
 	if active == 0 {
 		t.Close()
+		return
 	}
+
+	t.onGoAway()
 }
 
 // setGoAwayReason sets the value of t.goAwayReason based
@@ -1375,12 +1385,4 @@ func (t *http2Client) keepalive() {
 			return
 		}
 	}
-}
-
-func (t *http2Client) Error() <-chan struct{} {
-	return t.ctx.Done()
-}
-
-func (t *http2Client) GoAway() <-chan struct{} {
-	return t.goAway
 }
