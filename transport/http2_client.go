@@ -39,6 +39,9 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+	"bytes"
+	"runtime"
+	"strconv"
 )
 
 // http2Client implements the ClientTransport interface with HTTP2.
@@ -119,6 +122,9 @@ type http2Client struct {
 	msgRecv           int64
 	lastMsgSent       time.Time
 	lastMsgRecv       time.Time
+
+	onGoAway   func()
+	onShutdown func()
 }
 
 func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error), addr string) (net.Conn, error) {
@@ -147,7 +153,7 @@ func isTemporary(err error) bool {
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
-func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts ConnectOptions, onSuccess func()) (_ ClientTransport, err error) {
+func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts ConnectOptions, onSuccess, onGoAway, onShutdown func()) (_ ClientTransport, err error) {
 	scheme := "http"
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
@@ -231,6 +237,8 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		maxConcurrentStreams:  defaultMaxStreamsClient,
 		streamQuota:           defaultMaxStreamsClient,
 		streamsQuotaAvailable: make(chan struct{}, 1),
+		onGoAway:              onGoAway,
+		onShutdown:            onShutdown,
 	}
 	t.controlBuf = newControlBuffer(t.ctxDone)
 	if opts.InitialWindowSize >= defaultWindowSize {
@@ -266,10 +274,12 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 	// Send connection preface to server.
 	n, err := t.conn.Write(clientPreface)
 	if err != nil {
+		//fmt.Println(getGID(), "closing 1")
 		t.Close()
 		return nil, connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
 	}
 	if n != len(clientPreface) {
+		//fmt.Println(getGID(), "closing 2")
 		t.Close()
 		return nil, connectionErrorf(true, err, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
 	}
@@ -282,12 +292,14 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		err = t.framer.fr.WriteSettings()
 	}
 	if err != nil {
+		//fmt.Println(getGID(), "closing 3")
 		t.Close()
 		return nil, connectionErrorf(true, err, "transport: failed to write initial settings frame: %v", err)
 	}
 	// Adjust the connection flow control window if needed.
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
 		if err := t.framer.fr.WriteWindowUpdate(0, delta); err != nil {
+			//fmt.Println(getGID(), "closing 4")
 			t.Close()
 			return nil, connectionErrorf(true, err, "transport: failed to write window update: %v", err)
 		}
@@ -688,6 +700,7 @@ func (t *http2Client) closeStream(s *Stream, err error, rst bool, rstCode http2.
 // only once on a transport. Once it is called, the transport should not be
 // accessed any more.
 func (t *http2Client) Close() error {
+	//fmt.Println(getGID(), "T.CLOSE")
 	t.mu.Lock()
 	// Make sure we only Close once.
 	if t.state == closing {
@@ -714,6 +727,7 @@ func (t *http2Client) Close() error {
 		}
 		t.statsHandler.HandleConn(t.ctx, connEnd)
 	}
+	t.onShutdown()
 	return err
 }
 
@@ -733,6 +747,7 @@ func (t *http2Client) GracefulClose() error {
 	active := len(t.activeStreams)
 	t.mu.Unlock()
 	if active == 0 {
+		//fmt.Println(getGID(), "closing 13")
 		return t.Close()
 	}
 	return nil
@@ -954,6 +969,16 @@ func (t *http2Client) handlePing(f *http2.PingFrame) {
 	t.controlBuf.put(pingAck)
 }
 
+func getGID() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	b = b[:bytes.IndexByte(b, ' ')]
+	n, _ := strconv.ParseUint(string(b), 10, 64)
+	return n
+}
+
+
 func (t *http2Client) handleGoAway(f *http2.GoAwayFrame) {
 	t.mu.Lock()
 	if t.state == closing {
@@ -966,6 +991,7 @@ func (t *http2Client) handleGoAway(f *http2.GoAwayFrame) {
 	id := f.LastStreamID
 	if id > 0 && id%2 != 1 {
 		t.mu.Unlock()
+		//fmt.Println(getGID(), "closing 6")
 		t.Close()
 		return
 	}
@@ -984,6 +1010,7 @@ func (t *http2Client) handleGoAway(f *http2.GoAwayFrame) {
 		// If there are multiple GoAways the first one should always have an ID greater than the following ones.
 		if id > t.prevGoAwayID {
 			t.mu.Unlock()
+			//fmt.Println(getGID(), "closing 7")
 			t.Close()
 			return
 		}
@@ -1010,7 +1037,11 @@ func (t *http2Client) handleGoAway(f *http2.GoAwayFrame) {
 	active := len(t.activeStreams)
 	t.mu.Unlock()
 	if active == 0 {
+		//fmt.Println(getGID(), "closing 8")
 		t.Close()
+	} else {
+		// We don't want to onShutdown -> onGoAway
+		t.onGoAway()
 	}
 }
 
@@ -1107,12 +1138,14 @@ func (t *http2Client) reader() {
 	// Check the validity of server preface.
 	frame, err := t.framer.fr.ReadFrame()
 	if err != nil {
+		//fmt.Println(getGID(), "closing 9")
 		t.Close()
 		return
 	}
 	atomic.CompareAndSwapUint32(&t.activity, 0, 1)
 	sf, ok := frame.(*http2.SettingsFrame)
 	if !ok {
+		//fmt.Println(getGID(), "closing 10")
 		t.Close()
 		return
 	}
@@ -1139,6 +1172,7 @@ func (t *http2Client) reader() {
 				continue
 			} else {
 				// Transport error.
+				//fmt.Println(getGID(), "closing 11")
 				t.Close()
 				return
 			}
@@ -1207,6 +1241,7 @@ func (t *http2Client) keepalive() {
 					timer.Reset(t.kp.Time)
 					continue
 				}
+				//fmt.Println(getGID(), "closing 12")
 				t.Close()
 				return
 			case <-t.ctx.Done():
