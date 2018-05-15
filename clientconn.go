@@ -1287,6 +1287,7 @@ func (ac *addrConn) continuallyRejuvenateTransport() error {
 
 			ac.mu.Lock()
 			delete(ac.transports, newTrID)
+			ac.transport = nil
 			ac.mu.Unlock()
 
 			select {
