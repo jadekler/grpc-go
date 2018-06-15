@@ -1218,9 +1218,8 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 		}
 		ac.transport = nil
 
-	ac.mu.Lock()
-	backoffIdx := ac.backoffIdx
-	backoffFor := ac.dopts.bs.Backoff(backoffIdx)
+		backoffIdx := ac.backoffIdx
+		backoffFor := ac.dopts.bs.Backoff(backoffIdx)
 
 		// This will be the duration that dial gets to finish.
 		dialDuration := getMinConnectTimeout()
