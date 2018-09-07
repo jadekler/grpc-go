@@ -1131,11 +1131,12 @@ func (ac *addrConn) nextAddr() error {
 		ac.ready = nil
 	}
 	backoffDeadline := ac.backoffDeadline
+	b := ac.resetBackoff
 	ac.mu.Unlock()
 	timer := time.NewTimer(backoffDeadline.Sub(time.Now()))
 	select {
 	case <-timer.C:
-	case <-ac.resetBackoff:
+	case <-b:
 		timer.Stop()
 	case <-ac.ctx.Done():
 		timer.Stop()
