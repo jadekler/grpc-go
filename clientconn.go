@@ -531,7 +531,7 @@ func (cc *ClientConn) newAddrConn(addrs []resolver.Address) (*addrConn, error) {
 		dopts:               cc.dopts,
 		czData:              new(channelzData),
 		successfulHandshake: true, // make the first nextAddr() call _not_ move addrIdx up by 1
-		resetBackoff: make(chan struct{}),
+		resetBackoff:        make(chan struct{}),
 	}
 	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
 	// Track ac in cc. This needs to be done before any getTransport(...) is called.
@@ -959,7 +959,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		case <-skipReset: // The outer resetTransport loop will handle reconnection.
 			return
 		case <-allowedToReset: // We're in the clear to reset.
-			go oneReset.Do(func() {ac.resetTransport(false)})
+			go oneReset.Do(func() { ac.resetTransport(false) })
 		}
 	}
 
@@ -973,7 +973,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 			ac.mu.Lock()
 			ac.transport = nil
 			ac.mu.Unlock()
-			oneReset.Do(func() {ac.resetTransport(false)})
+			oneReset.Do(func() { ac.resetTransport(false) })
 		}
 	}
 
