@@ -45,7 +45,6 @@ import (
 	_ "google.golang.org/grpc/resolver/dns"         // To register dns resolver.
 	_ "google.golang.org/grpc/resolver/passthrough" // To register passthrough resolver.
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/internal/grpcsync"
 )
 
 const (
@@ -532,6 +531,7 @@ func (cc *ClientConn) newAddrConn(addrs []resolver.Address) (*addrConn, error) {
 		dopts:               cc.dopts,
 		czData:              new(channelzData),
 		successfulHandshake: true, // make the first nextAddr() call _not_ move addrIdx up by 1
+		resetBackoff: make(chan struct{}),
 	}
 	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
 	// Track ac in cc. This needs to be done before any getTransport(...) is called.
@@ -946,7 +946,7 @@ var errReadTimedOut = errors.New("read timed out")
 // createTransport creates a connection to one of the backends in addrs.
 func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time) error {
 	oneReset := sync.Once{}
-	skipReset := grpcsync.Event{}
+	skipReset := make(chan struct{})
 	allowedToReset := make(chan struct{})
 	prefaceReceived := make(chan struct{})
 	onCloseCalled := make(chan struct{})
@@ -956,7 +956,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		ac.adjustParams(r)
 		ac.mu.Unlock()
 		select {
-		case <-skipReset.Done(): // The outer resetTransport loop will handle reconnection.
+		case <-skipReset: // The outer resetTransport loop will handle reconnection.
 			return
 		case <-allowedToReset: // We're in the clear to reset.
 			go oneReset.Do(func() {ac.resetTransport(false)})
@@ -967,7 +967,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		close(onCloseCalled)
 
 		select {
-		case <-skipReset.Done(): // The outer resetTransport loop will handle reconnection.
+		case <-skipReset: // The outer resetTransport loop will handle reconnection.
 			return
 		case <-allowedToReset: // We're in the clear to reset.
 			ac.mu.Lock()
@@ -1025,7 +1025,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 			case <-prefaceTimer.C:
 				// We want to close but _not_ reset, because we're going into the transient-failure-and-return flow
 				// and go into the next cycle of the resetTransport loop.
-				skipReset.Fire()
+				close(skipReset)
 				newTr.Close()
 				err = errors.New("timed out")
 			case <-prefaceReceived:
@@ -1048,7 +1048,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 			// We don't want to reset during this close because we prefer to kick out of this function and let the loop
 			// in resetTransport take care of reconnecting.
-			skipReset.Fire()
+			close(skipReset)
 
 			return errConnClosing
 		}
@@ -1059,7 +1059,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 		// We don't want to reset during this close because we prefer to kick out of this function and let the loop
 		// in resetTransport take care of reconnecting.
-		skipReset.Fire()
+		close(skipReset)
 
 		return err
 	}
@@ -1071,7 +1071,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 		// We don't want to reset during this close because we prefer to kick out of this function and let the loop
 		// in resetTransport take care of reconnecting.
-		skipReset.Fire()
+		close(skipReset)
 
 		newTr.Close()
 		return errConnClosing
@@ -1135,13 +1135,21 @@ func (ac *addrConn) nextAddr() error {
 	timer := time.NewTimer(backoffDeadline.Sub(time.Now()))
 	select {
 	case <-timer.C:
-	case <-resetBackoff:
+	case <-ac.resetBackoff:
 		timer.Stop()
 	case <-ac.ctx.Done():
 		timer.Stop()
 		return ac.ctx.Err()
 	}
 	return nil
+}
+
+func (ac *addrConn) resetConnectBackoff() {
+	ac.mu.Lock()
+	close(ac.resetBackoff)
+	ac.backoffIdx = 0
+	ac.resetBackoff = make(chan struct{})
+	ac.mu.Unlock()
 }
 
 // getReadyTransport returns the transport if ac's state is READY.
