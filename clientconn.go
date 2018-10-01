@@ -1057,6 +1057,16 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 	onClose := func() {
 		close(onCloseCalled)
+
+		ac.mu.Lock()
+		if ac.state == connectivity.Shutdown {
+			ac.mu.Unlock()
+			return
+		}
+		ac.updateConnectivityState(connectivity.TransientFailure)
+		ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+		ac.mu.Unlock()
+
 		prefaceTimer.Stop()
 
 		select {
@@ -1109,6 +1119,8 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 				// We got the preface - huzzah! things are good.
 			case <-onCloseCalled:
 				// The transport has already closed - noop.
+				close(allowedToReset)
+				return nil
 			}
 		} else {
 			go func() {
@@ -1213,8 +1225,6 @@ func (ac *addrConn) nextAddr() error {
 		ac.mu.Unlock()
 		return errConnClosing
 	}
-	ac.updateConnectivityState(connectivity.TransientFailure)
-	ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
 	ac.cc.resolveNow(resolver.ResolveNowOption{})
 	if ac.ready != nil {
 		close(ac.ready)

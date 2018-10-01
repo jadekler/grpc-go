@@ -820,3 +820,126 @@ func TestBackoffCancel(t *testing.T) {
 	cc.Close()
 	// Should not leak. May need -count 5000 to exercise.
 }
+
+// CONNECTING -> READY -> TRANSIENT FAILURE -> CONNECTING -> TRANSIENT FAILURE -> CONNECTING -> TRANSIENT FAILURE
+func TestDialCloseStateTransition(t *testing.T) {
+	defer leakcheck.Check(t)
+
+	server, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error while listening. Err: %v", err)
+	}
+	defer server.Close()
+	testFinished := make(chan struct{})
+	defer close(testFinished)
+	killFirstConnection := make(chan struct{})
+	killSecondConnection := make(chan struct{})
+
+	// Launch the server.
+	go func() {
+		// Establish a successful connection so that we enter READY. We need to get
+		// to READY so that we can get a client back for us to introspect later (as
+		// opposed to just CONNECTING).
+		conn, err := server.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+
+		framer := http2.NewFramer(conn, conn)
+		if err := framer.WriteSettings(http2.Setting{}); err != nil {
+			t.Errorf("Error while writing settings frame. %v", err)
+			return
+		}
+
+		select {
+		case <-testFinished:
+			return
+		case <-killFirstConnection:
+		}
+
+		// Close the conn to cause onShutdown, causing us to enter TRANSIENT FAILURE. Note that we are not in
+		// WaitForHandshake at this point because the preface was sent successfully.
+		conn.Close()
+
+		// We have to re-accept and re-close the connection because the first re-connect after a successful handshake
+		// has no backoff. So, we need to get to the second re-connect after the successful handshake for our infinite
+		// backoff to happen.
+		conn, err = server.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		err = conn.Close()
+		if err != nil {
+			t.Error(err)
+		}
+
+		// Re-connect (without server preface).
+		conn, err = server.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		// Close the conn to cause onShutdown, causing us to enter TRANSIENT FAILURE. Note that we are in
+		// WaitForHandshake at this point because the preface has not been sent yet.
+		select {
+		case <-testFinished:
+			return
+		case <-killSecondConnection:
+		}
+		conn.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client, err := DialContext(ctx, server.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock(), withBackoff(backoffForever{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// It should start in READY because the server sends the server preface.
+	if client.GetState() != connectivity.Ready {
+		t.Fatalf("expected addrconn to be in READY, was %v", client.GetState())
+	}
+
+	// Once the connection is killed, it should go:
+	// READY -> CONNECTING -> TRANSIENT FAILURE (no backoff) -> CONNECTING -> TRANSIENT FAILURE (infinite backoff)
+	// We tend to miss the middle transitions, since they are racy, so we'll sleep through them.
+	close(killFirstConnection)
+	time.Sleep(50 * time.Millisecond)
+	s := client.GetState()
+	if s != connectivity.TransientFailure {
+		t.Fatalf("expected addrconn to be in TRANSIENT FAILURE, was %v", s)
+	}
+
+	// Stop backing off, allowing a re-connect.
+	client.ResetConnectBackoff()
+	client.WaitForStateChange(ctx, connectivity.TransientFailure)
+	s = client.GetState()
+	if s != connectivity.Connecting {
+		t.Fatalf("expected addrconn to be in CONNECTING, was %v", s)
+	}
+
+	// Wait some milliseconds to set up the watch below, then kill the connection.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-testFinished:
+		case killSecondConnection <- struct{}{}:
+		}
+	}()
+
+	// The connection should be killed shortly by the above goroutine, and here we watch for the first new connectivity
+	// state and make sure it's TRANSIENT FAILURE. This is racy, but fairly accurate - expect it to catch failures
+	// 90% of the time or so.
+	client.WaitForStateChange(ctx, connectivity.Connecting)
+	s = client.GetState()
+	if s != connectivity.TransientFailure {
+		t.Fatalf("expected addrconn to be in TRANSIENT FAILURE, was %v", s)
+	}
+}
