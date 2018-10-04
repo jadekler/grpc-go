@@ -134,11 +134,11 @@ func TestDialWithMultipleBackendsNotSendingServerPreface(t *testing.T) {
 
 func TestDialWaitsForServerSettings(t *testing.T) {
 	defer leakcheck.Check(t)
-	server, err := net.Listen("tcp", "localhost:0")
+	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
 	}
-	defer server.Close()
+	defer lis.Close()
 	done := make(chan struct{})
 	sent := make(chan struct{})
 	dialDone := make(chan struct{})
@@ -146,7 +146,7 @@ func TestDialWaitsForServerSettings(t *testing.T) {
 		defer func() {
 			close(done)
 		}()
-		conn, err := server.Accept()
+		conn, err := lis.Accept()
 		if err != nil {
 			t.Errorf("Error while accepting. Err: %v", err)
 			return
@@ -165,7 +165,7 @@ func TestDialWaitsForServerSettings(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, err := DialContext(ctx, server.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock())
+	client, err := DialContext(ctx, lis.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock())
 	close(dialDone)
 	if err != nil {
 		t.Fatalf("Error while dialing. Err: %v", err)
@@ -182,7 +182,7 @@ func TestDialWaitsForServerSettings(t *testing.T) {
 
 func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 	defer leakcheck.Check(t)
-	server, err := net.Listen("tcp", "localhost:0")
+	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 			close(done)
 		}()
 		for {
-			conn, err := server.Accept()
+			conn, err := lis.Accept()
 			if err != nil {
 				break
 			}
@@ -204,8 +204,8 @@ func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 	getMinConnectTimeout = func() time.Duration { return time.Second / 2 }
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	client, err := DialContext(ctx, server.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock())
-	server.Close()
+	client, err := DialContext(ctx, lis.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock())
+	lis.Close()
 	if err == nil {
 		client.Close()
 		t.Fatalf("Unexpected success (err=nil) while dialing")
@@ -305,17 +305,17 @@ func TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 
 func TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 	defer leakcheck.Check(t)
-	server, err := net.Listen("tcp", "localhost:0")
+	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
 	}
-	defer server.Close()
+	defer lis.Close()
 	done := make(chan struct{})
 	go func() { // Launch the server.
 		defer func() {
 			close(done)
 		}()
-		conn, err := server.Accept() // Accept the connection only to close it immediately.
+		conn, err := lis.Accept() // Accept the connection only to close it immediately.
 		if err != nil {
 			t.Errorf("Error while accepting. Err: %v", err)
 			return
@@ -325,7 +325,7 @@ func TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 		var prevDuration time.Duration
 		// Make sure the retry attempts are backed off properly.
 		for i := 0; i < 3; i++ {
-			conn, err := server.Accept()
+			conn, err := lis.Accept()
 			if err != nil {
 				t.Errorf("Error while accepting. Err: %v", err)
 				return
@@ -341,7 +341,7 @@ func TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 			prevAt = meow
 		}
 	}()
-	client, err := Dial(server.Addr().String(), WithInsecure())
+	client, err := Dial(lis.Addr().String(), WithInsecure())
 	if err != nil {
 		t.Fatalf("Error while dialing. Err: %v", err)
 	}
@@ -825,13 +825,14 @@ func TestBackoffCancel(t *testing.T) {
 func TestDialCloseStateTransition(t *testing.T) {
 	defer leakcheck.Check(t)
 
-	server, err := net.Listen("tcp", "localhost:0")
+	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
 	}
-	defer server.Close()
+	defer lis.Close()
 	testFinished := make(chan struct{})
-	defer close(testFinished)
+	backoffCaseReady := make(chan struct{}, 1)
+	defer close(backoffCaseReady)
 	killFirstConnection := make(chan struct{})
 	killSecondConnection := make(chan struct{})
 
@@ -840,7 +841,7 @@ func TestDialCloseStateTransition(t *testing.T) {
 		// Establish a successful connection so that we enter READY. We need to get
 		// to READY so that we can get a client back for us to introspect later (as
 		// opposed to just CONNECTING).
-		conn, err := server.Accept()
+		conn, err := lis.Accept()
 		if err != nil {
 			t.Error(err)
 			return
@@ -866,7 +867,7 @@ func TestDialCloseStateTransition(t *testing.T) {
 		// We have to re-accept and re-close the connection because the first re-connect after a successful handshake
 		// has no backoff. So, we need to get to the second re-connect after the successful handshake for our infinite
 		// backoff to happen.
-		conn, err = server.Accept()
+		conn, err = lis.Accept()
 		if err != nil {
 			t.Error(err)
 			return
@@ -876,8 +877,11 @@ func TestDialCloseStateTransition(t *testing.T) {
 			t.Error(err)
 		}
 
+		// The client should now be headed towards backoff.
+		backoffCaseReady <- struct{}{}
+
 		// Re-connect (without server preface).
-		conn, err = server.Accept()
+		conn, err = lis.Accept()
 		if err != nil {
 			t.Error(err)
 			return
@@ -893,10 +897,10 @@ func TestDialCloseStateTransition(t *testing.T) {
 		conn.Close()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client, err := DialContext(ctx, server.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock(), withBackoff(backoffForever{}))
+	client, err := DialContext(ctx, lis.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock(), withBackoff(backoffForever{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -909,30 +913,36 @@ func TestDialCloseStateTransition(t *testing.T) {
 
 	// Once the connection is killed, it should go:
 	// READY -> CONNECTING -> TRANSIENT FAILURE (no backoff) -> CONNECTING -> TRANSIENT FAILURE (infinite backoff)
-	// We tend to miss the middle transitions, since they are racy, so we'll sleep through them.
+	// The first TRANSIENT FAILURE is triggered by closing a channel. Then, we wait for the server to let us know
+	// when the client has progressed past the first failure (which does not get backoff, because handshake was
+	// successful).
 	close(killFirstConnection)
-	time.Sleep(50 * time.Millisecond)
+	<-backoffCaseReady
+	client.WaitForStateChange(ctx, connectivity.Connecting)
 	s := client.GetState()
 	if s != connectivity.TransientFailure {
 		t.Fatalf("expected addrconn to be in TRANSIENT FAILURE, was %v", s)
 	}
 
-	// Stop backing off, allowing a re-connect.
-	client.ResetConnectBackoff()
-	client.WaitForStateChange(ctx, connectivity.TransientFailure)
+	// Stop backing off, allowing a re-connect. Note: this races with the client actually getting to the backoff,
+	// so continually reset backoff until we notice the state change.
+	for i := 0; i < 100; i++ {
+		client.ResetConnectBackoff()
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		defer cancel()
+		if client.WaitForStateChange(cctx, connectivity.TransientFailure) {
+			break
+		}
+	}
 	s = client.GetState()
 	if s != connectivity.Connecting {
 		t.Fatalf("expected addrconn to be in CONNECTING, was %v", s)
 	}
 
-	// Wait some milliseconds to set up the watch below, then kill the connection.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		select {
-		case <-testFinished:
-		case killSecondConnection <- struct{}{}:
-		}
-	}()
+	select {
+	case <-testFinished:
+	case killSecondConnection <- struct{}{}:
+	}
 
 	// The connection should be killed shortly by the above goroutine, and here we watch for the first new connectivity
 	// state and make sure it's TRANSIENT FAILURE. This is racy, but fairly accurate - expect it to catch failures

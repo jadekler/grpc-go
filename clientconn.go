@@ -643,11 +643,9 @@ func (cc *ClientConn) incrCallsFailed() {
 	atomic.AddInt64(&cc.czData.callsFailed, 1)
 }
 
-// connect starts to creating transport and also starts the transport monitor
-// goroutine for this ac.
+// connect starts creating a transport.
 // It does nothing if the ac is not IDLE.
 // TODO(bar) Move this to the addrConn section.
-// This was part of resetAddrConn, keep it here to make the diff look clean.
 func (ac *addrConn) connect() error {
 	ac.mu.Lock()
 	if ac.state == connectivity.Shutdown {
