@@ -961,6 +961,21 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 			ac.mu.Unlock()
 		}
 
+		ac.mu.Lock()
+		if ac.state == connectivity.Shutdown {
+			ac.mu.Unlock()
+			return
+		}
+
+		// If we're at the beginning of the address list
+		// And we didn't just see a successful handshake
+		// And it's not the very first addr to try (covered by the above if)
+		if ac.addrIdx != -1 && ac.addrIdx == len(ac.addrs)-1 && !ac.successfulHandshake {
+			ac.updateConnectivityState(connectivity.TransientFailure)
+			ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+		}
+		ac.mu.Unlock()
+
 		if err := ac.nextAddr(); err != nil {
 			return
 		}
@@ -1055,16 +1070,6 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 	onClose := func() {
 		close(onCloseCalled)
-
-		ac.mu.Lock()
-		if ac.state == connectivity.Shutdown {
-			ac.mu.Unlock()
-			return
-		}
-		ac.updateConnectivityState(connectivity.TransientFailure)
-		ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
-		ac.mu.Unlock()
-
 		prefaceTimer.Stop()
 
 		select {
@@ -1090,7 +1095,11 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 		// TODO(deklerk): optimization; does anyone else actually use this lock? maybe we can just remove it for this scope
 		ac.mu.Lock()
+
+		// There's some unfortunate magic here: this is a signal to resetTransport on the very first loop that
+		// it is the first connection attempt (so it should not attempt to increment addrIdx).
 		ac.successfulHandshake = true
+
 		ac.backoffDeadline = time.Time{}
 		ac.connectDeadline = time.Time{}
 		ac.addrIdx = 0
