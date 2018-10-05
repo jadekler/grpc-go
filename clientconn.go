@@ -872,7 +872,6 @@ type addrConn struct {
 	transport transport.ClientTransport // The current transport.
 
 	mu      sync.Mutex
-	addrIdx int                // The index in addrs list to start reconnecting from.
 	curAddr resolver.Address   // The current address.
 	addrs   []resolver.Address // All addresses that the resolver resolved to.
 
@@ -884,20 +883,10 @@ type addrConn struct {
 
 	tearDownErr error // The reason this addrConn is torn down.
 
-	backoffIdx int
-	// backoffDeadline is the time until which resetTransport needs to
-	// wait before increasing backoffIdx count.
-	backoffDeadline time.Time
-	// connectDeadline is the time by which all connection
-	// negotiations must complete.
-	connectDeadline time.Time
-
 	resetBackoff chan struct{}
 
 	channelzID int64 // channelz unique identification number
 	czData     *channelzData
-
-	successfulHandshake bool
 }
 
 // Note: this requires a lock on ac.mu.
@@ -951,48 +940,28 @@ func (ac *addrConn) errorf(format string, a ...interface{}) {
 // (addresses are exhausted). The backoff amount is reset to 0 each time a handshake is received.
 //
 // If the DialOption WithWaitForHandshake was set, resetTransport returns successfully only after handshake is received.
-func (ac *addrConn) resetTransport(resolveNow bool) {
+func (ac *addrConn) resetTransport() {
+	var mu sync.Mutex
+	var backoffIdx int
+
+	onPrefaceReceipt := func() {
+		mu.Lock()
+		backoffIdx = 0
+		mu.Unlock()
+	}
+
 	for {
-		// If this is the first in a line of resets, we want to resolve immediately. The only other time we
-		// want to reset is if we have tried all the addresses handed to us.
-		if resolveNow {
-			ac.mu.Lock()
-			ac.cc.resolveNow(resolver.ResolveNowOption{})
-			ac.mu.Unlock()
-		}
-
 		ac.mu.Lock()
 		if ac.state == connectivity.Shutdown {
 			ac.mu.Unlock()
 			return
 		}
+		ac.cc.resolveNow(resolver.ResolveNowOption{})
+		addrs := ac.addrs
 
-		// If we're at the beginning of the address list
-		// And we didn't just see a successful handshake
-		// And it's not the very first addr to try (covered by the above if)
-		if ac.addrIdx != -1 && ac.addrIdx == len(ac.addrs)-1 && !ac.successfulHandshake {
-			ac.updateConnectivityState(connectivity.TransientFailure)
-			ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
-		}
-		ac.mu.Unlock()
-
-		if err := ac.nextAddr(); err != nil {
-			return
-		}
-
-		ac.mu.Lock()
-		if ac.state == connectivity.Shutdown {
-			ac.mu.Unlock()
-			return
-		}
-		if ac.ready != nil {
-			close(ac.ready)
-			ac.ready = nil
-		}
-		ac.transport = nil
-
-		backoffIdx := ac.backoffIdx
+		mu.Lock()
 		backoffFor := ac.dopts.bs.Backoff(backoffIdx)
+		mu.Unlock()
 
 		// This will be the duration that dial gets to finish.
 		dialDuration := getMinConnectTimeout()
@@ -1000,57 +969,90 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 			// Give dial more time as we keep failing to connect.
 			dialDuration = backoffFor
 		}
-		start := time.Now()
-		connectDeadline := start.Add(dialDuration)
-		ac.backoffDeadline = start.Add(backoffFor)
-		ac.connectDeadline = connectDeadline
-
 		ac.mu.Unlock()
 
-		ac.cc.mu.RLock()
-		ac.dopts.copts.KeepaliveParams = ac.cc.mkp
-		ac.cc.mu.RUnlock()
-
-		ac.mu.Lock()
-
-		if ac.state == connectivity.Shutdown {
+		for _, addr := range addrs {
+			ac.mu.Lock()
+			if ac.ready != nil {
+				close(ac.ready)
+				ac.ready = nil
+			}
+			ac.transport = nil
+			connectDeadline := time.Now().Add(dialDuration)
 			ac.mu.Unlock()
+
+			ac.cc.mu.RLock()
+			ac.dopts.copts.KeepaliveParams = ac.cc.mkp
+			ac.cc.mu.RUnlock()
+
+			ac.mu.Lock()
+
+			if ac.state == connectivity.Shutdown {
+				ac.mu.Unlock()
+				return
+			}
+
+			ac.printf("connecting")
+			if ac.state != connectivity.Connecting {
+				ac.updateConnectivityState(connectivity.Connecting)
+				ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+			}
+
+			copts := ac.dopts.copts
+			if ac.scopts.CredsBundle != nil {
+				copts.CredsBundle = ac.scopts.CredsBundle
+			}
+			ac.mu.Unlock()
+
+			if channelz.IsOn() {
+				channelz.AddTraceEvent(ac.channelzID, &channelz.TraceEventDesc{
+					Desc:     fmt.Sprintf("Subchannel picks a new address %q to connect", addr.Addr),
+					Severity: channelz.CtINFO,
+				})
+			}
+
+			/*
+			Image 3 addresses. What happens in these cases?
+
+			- addr1 fails
+			> try addr2
+			- addr1 dial works (createTransport returns nil), but reader calls onClose
+			> ?? try addr2?
+			- addr1 success, much later addr1 fails
+			> ??
+			 */
+
+			allowedToReset := make(chan struct{}, 1)
+			if err := ac.createTransport(backoffIdx, addr, copts, connectDeadline, allowedToReset, onPrefaceReceipt); err == nil {
+				// success! wait here and re-connect
+				<- allowedToReset
+			}
+
+			ac.mu.Lock()
+			ac.updateConnectivityState(connectivity.TransientFailure)
+			ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+			ac.mu.Unlock()
+		}
+
+		// We ran out of addresses! Backoff and restart.
+		ac.mu.Lock()
+		b := ac.resetBackoff
+		ac.mu.Unlock()
+		timer := time.NewTimer(backoffFor)
+		select {
+		case <-timer.C:
+		case <-b:
+			timer.Stop()
+		case <-ac.ctx.Done():
+			timer.Stop()
 			return
 		}
-
-		ac.printf("connecting")
-		if ac.state != connectivity.Connecting {
-			ac.updateConnectivityState(connectivity.Connecting)
-			ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
-		}
-
-		addr := ac.addrs[ac.addrIdx]
-		copts := ac.dopts.copts
-		if ac.scopts.CredsBundle != nil {
-			copts.CredsBundle = ac.scopts.CredsBundle
-		}
-		ac.mu.Unlock()
-
-		if channelz.IsOn() {
-			channelz.AddTraceEvent(ac.channelzID, &channelz.TraceEventDesc{
-				Desc:     fmt.Sprintf("Subchannel picks a new address %q to connect", addr.Addr),
-				Severity: channelz.CtINFO,
-			})
-		}
-
-		if err := ac.createTransport(backoffIdx, addr, copts, connectDeadline); err != nil {
-			continue
-		}
-
-		return
 	}
 }
 
 // createTransport creates a connection to one of the backends in addrs.
-func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time) error {
-	oneReset := sync.Once{}
+func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time, allowedToReset chan struct{}, onPrefaceReceipt func()) error {
 	skipReset := make(chan struct{})
-	allowedToReset := make(chan struct{})
 	prefaceReceived := make(chan struct{})
 	onCloseCalled := make(chan struct{})
 
@@ -1061,12 +1063,17 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		select {
 		case <-skipReset: // The outer resetTransport loop will handle reconnection.
 			return
-		case <-allowedToReset: // We're in the clear to reset.
-			go oneReset.Do(func() { ac.resetTransport(false) })
+		case allowedToReset <- struct{}{}: // We're in the clear to reset.
 		}
 	}
 
 	prefaceTimer := time.NewTimer(connectDeadline.Sub(time.Now()))
+
+	onPrefaceReceiptWrapped := func() {
+		onPrefaceReceipt()
+		close(prefaceReceived)
+		prefaceTimer.Stop()
+	}
 
 	onClose := func() {
 		close(onCloseCalled)
@@ -1075,11 +1082,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		select {
 		case <-skipReset: // The outer resetTransport loop will handle reconnection.
 			return
-		case <-allowedToReset: // We're in the clear to reset.
-			ac.mu.Lock()
-			ac.transport = nil
-			ac.mu.Unlock()
-			oneReset.Do(func() { ac.resetTransport(false) })
+		case allowedToReset<-struct{}{}:
 		}
 	}
 
@@ -1089,31 +1092,13 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		Authority: ac.cc.authority,
 	}
 
-	onPrefaceReceipt := func() {
-		close(prefaceReceived)
-		prefaceTimer.Stop()
-
-		// TODO(deklerk): optimization; does anyone else actually use this lock? maybe we can just remove it for this scope
-		ac.mu.Lock()
-
-		// There's some unfortunate magic here: this is a signal to resetTransport on the very first loop that
-		// it is the first connection attempt (so it should not attempt to increment addrIdx).
-		ac.successfulHandshake = true
-
-		ac.backoffDeadline = time.Time{}
-		ac.connectDeadline = time.Time{}
-		ac.addrIdx = 0
-		ac.backoffIdx = 0
-		ac.mu.Unlock()
-	}
-
 	// Do not cancel in the success path because of this issue in Go1.6: https://github.com/golang/go/issues/15078.
 	connectCtx, cancel := context.WithDeadline(ac.ctx, connectDeadline)
 	if channelz.IsOn() {
 		copts.ChannelzParentID = ac.channelzID
 	}
 
-	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, target, copts, onPrefaceReceipt, onGoAway, onClose)
+	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, target, copts, onPrefaceReceiptWrapped, onGoAway, onClose)
 
 	if err == nil {
 		if ac.dopts.waitForHandshake {
@@ -1199,56 +1184,6 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 	// Ok, _now_ we will finally let the transport reset if it encounters a closable error. Without this, the reader
 	// goroutine failing races with all the code in this method that sets the connection to "ready".
 	close(allowedToReset)
-	return nil
-}
-
-// nextAddr increments the addrIdx if there are more addresses to try. If
-// there are no more addrs to try it will re-resolve, set addrIdx to 0, and
-// increment the backoffIdx.
-//
-// nextAddr must be called without ac.mu being held.
-func (ac *addrConn) nextAddr() error {
-	ac.mu.Lock()
-
-	// If a handshake has been observed, we expect the counters to have manually
-	// been reset so we'll just return, since we want the next usage to start
-	// at index 0.
-	if ac.successfulHandshake {
-		ac.successfulHandshake = false
-		ac.mu.Unlock()
-		return nil
-	}
-
-	if ac.addrIdx < len(ac.addrs)-1 {
-		ac.addrIdx++
-		ac.mu.Unlock()
-		return nil
-	}
-
-	ac.addrIdx = 0
-	ac.backoffIdx++
-
-	if ac.state == connectivity.Shutdown {
-		ac.mu.Unlock()
-		return errConnClosing
-	}
-	ac.cc.resolveNow(resolver.ResolveNowOption{})
-	if ac.ready != nil {
-		close(ac.ready)
-		ac.ready = nil
-	}
-	backoffDeadline := ac.backoffDeadline
-	b := ac.resetBackoff
-	ac.mu.Unlock()
-	timer := time.NewTimer(backoffDeadline.Sub(time.Now()))
-	select {
-	case <-timer.C:
-	case <-b:
-		timer.Stop()
-	case <-ac.ctx.Done():
-		timer.Stop()
-		return ac.ctx.Err()
-	}
 	return nil
 }
 
