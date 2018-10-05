@@ -45,6 +45,7 @@ import (
 	_ "google.golang.org/grpc/resolver/dns"         // To register dns resolver.
 	_ "google.golang.org/grpc/resolver/passthrough" // To register passthrough resolver.
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/internal/grpcsync"
 )
 
 const (
@@ -1022,10 +1023,22 @@ func (ac *addrConn) resetTransport() {
 			> ??
 			 */
 
-			allowedToReset := make(chan struct{}, 1)
-			if err := ac.createTransport(backoffIdx, addr, copts, connectDeadline, allowedToReset, onPrefaceReceipt); err == nil {
+			allowedToReset := grpcsync.NewEvent()
+			if newTr, err := ac.createTransport(backoffIdx, addr, copts, connectDeadline, allowedToReset, onPrefaceReceipt); err == nil {
+				ac.mu.Lock()
+				ac.printf("ready")
+				ac.updateConnectivityState(connectivity.Ready)
+				ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+				ac.transport = newTr
+				ac.curAddr = addr
+				if ac.ready != nil {
+					close(ac.ready)
+					ac.ready = nil
+				}
+				ac.mu.Unlock()
+
 				// success! wait here and re-connect
-				<- allowedToReset
+				allowedToReset.Done()
 			}
 
 			ac.mu.Lock()
@@ -1051,7 +1064,7 @@ func (ac *addrConn) resetTransport() {
 }
 
 // createTransport creates a connection to one of the backends in addrs.
-func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time, allowedToReset chan struct{}, onPrefaceReceipt func()) error {
+func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts transport.ConnectOptions, connectDeadline time.Time, allowedToReset *grpcsync.Event, onPrefaceReceipt func()) (transport.ClientTransport, error) {
 	skipReset := make(chan struct{})
 	prefaceReceived := make(chan struct{})
 	onCloseCalled := make(chan struct{})
@@ -1060,11 +1073,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		ac.mu.Lock()
 		ac.adjustParams(r)
 		ac.mu.Unlock()
-		select {
-		case <-skipReset: // The outer resetTransport loop will handle reconnection.
-			return
-		case allowedToReset <- struct{}{}: // We're in the clear to reset.
-		}
+		allowedToReset.Fire()
 	}
 
 	prefaceTimer := time.NewTimer(connectDeadline.Sub(time.Now()))
@@ -1078,12 +1087,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 	onClose := func() {
 		close(onCloseCalled)
 		prefaceTimer.Stop()
-
-		select {
-		case <-skipReset: // The outer resetTransport loop will handle reconnection.
-			return
-		case allowedToReset<-struct{}{}:
-		}
+		allowedToReset.Fire()
 	}
 
 	target := transport.TargetInfo{
@@ -1111,8 +1115,8 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 				// We got the preface - huzzah! things are good.
 			case <-onCloseCalled:
 				// The transport has already closed - noop.
-				close(allowedToReset)
-				return nil
+				allowedToReset.Fire()
+				return newTr, nil
 			}
 		} else {
 			go func() {
@@ -1142,7 +1146,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 			// in resetTransport take care of reconnecting.
 			close(skipReset)
 
-			return errConnClosing
+			return nil, errConnClosing
 		}
 		ac.updateConnectivityState(connectivity.TransientFailure)
 		ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
@@ -1153,7 +1157,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		// in resetTransport take care of reconnecting.
 		close(skipReset)
 
-		return err
+		return nil, err
 	}
 
 	ac.mu.Lock()
@@ -1166,31 +1170,17 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		close(skipReset)
 
 		newTr.Close()
-		return errConnClosing
-	}
-
-	ac.printf("ready")
-	ac.updateConnectivityState(connectivity.Ready)
-	ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
-	ac.transport = newTr
-	ac.curAddr = addr
-	if ac.ready != nil {
-		close(ac.ready)
-		ac.ready = nil
+		return nil, errConnClosing
 	}
 
 	ac.mu.Unlock()
 
-	// Ok, _now_ we will finally let the transport reset if it encounters a closable error. Without this, the reader
-	// goroutine failing races with all the code in this method that sets the connection to "ready".
-	close(allowedToReset)
-	return nil
+	return newTr, nil
 }
 
 func (ac *addrConn) resetConnectBackoff() {
 	ac.mu.Lock()
 	close(ac.resetBackoff)
-	ac.backoffIdx = 0
 	ac.resetBackoff = make(chan struct{})
 	ac.mu.Unlock()
 }
