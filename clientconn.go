@@ -909,6 +909,7 @@ type addrConn struct {
 
 // Note: this requires a lock on ac.mu.
 func (ac *addrConn) updateConnectivityState(s connectivity.State) {
+	fmt.Println("-------------------", s)
 	ac.state = s
 	if channelz.IsOn() {
 		channelz.AddTraceEvent(ac.channelzID, &channelz.TraceEventDesc{
@@ -979,6 +980,7 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 		//   We've exhausted all addresses
 		//   We're in CONNECTING
 		//   And it's not the very first addr to try TODO(deklerk) find a better way to do this than checking ac.successfulHandshake
+		fmt.Println("yoyo", ac.addrIdx, ac.addrs, ac.state, ac.successfulHandshake)
 		if ac.state == connectivity.Ready || (ac.addrIdx == len(ac.addrs)-1 && ac.state == connectivity.Connecting && !ac.successfulHandshake) {
 			ac.updateConnectivityState(connectivity.TransientFailure)
 			ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
@@ -1034,6 +1036,7 @@ func (ac *addrConn) resetTransport(resolveNow bool) {
 		if ac.scopts.CredsBundle != nil {
 			copts.CredsBundle = ac.scopts.CredsBundle
 		}
+		fmt.Println("+++++", addr, ac.addrIdx)
 		ac.mu.Unlock()
 
 		if channelz.IsOn() {
@@ -1060,6 +1063,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 	onCloseCalled := make(chan struct{})
 
 	onGoAway := func(r transport.GoAwayReason) {
+		fmt.Println("onGoAway")
 		ac.mu.Lock()
 		ac.adjustParams(r)
 		ac.mu.Unlock()
@@ -1074,6 +1078,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 	prefaceTimer := time.NewTimer(connectDeadline.Sub(time.Now()))
 
 	onClose := func() {
+		fmt.Println("onClose")
 		close(onCloseCalled)
 		prefaceTimer.Stop()
 
@@ -1095,6 +1100,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 	}
 
 	onPrefaceReceipt := func() {
+		fmt.Println("onPrefaceReceipt")
 		close(prefaceReceived)
 		prefaceTimer.Stop()
 
@@ -1120,12 +1126,15 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 		if ac.dopts.waitForHandshake {
 			select {
 			case <-prefaceTimer.C:
+				fmt.Println("<-prefaceTimer.C")
 				// We didn't get the preface in time.
 				newTr.Close()
 				err = errors.New("timed out waiting for server handshake")
 			case <-prefaceReceived:
+				fmt.Println("<-prefaceReceived")
 				// We got the preface - huzzah! things are good.
 			case <-onCloseCalled:
+				fmt.Println("<-onCloseCalled")
 				// The transport has already closed - noop.
 				close(allowedToReset)
 				return nil
@@ -1160,8 +1169,7 @@ func (ac *addrConn) createTransport(backoffNum int, addr resolver.Address, copts
 
 			return errConnClosing
 		}
-		ac.updateConnectivityState(connectivity.TransientFailure)
-		ac.cc.handleSubConnStateChange(ac.acbw, ac.state)
+		fmt.Println("here!?!? 123", err)
 		ac.mu.Unlock()
 		grpclog.Warningf("grpc: addrConn.createTransport failed to connect to %v. Err :%v. Reconnecting...", addr, err)
 
