@@ -167,6 +167,12 @@ func TestHealthCheckWatchStateChange(t *testing.T) {
 	if ok := cc.WaitForStateChange(ctx, connectivity.Connecting); !ok {
 		t.Fatal("ClientConn is still in CONNECTING state when the context times out.")
 	}
+	if ok := cc.WaitForStateChange(ctx, connectivity.Ready); !ok {
+		t.Fatal("ClientConn is still in READY state when the context times out.")
+	}
+	if ok := cc.WaitForStateChange(ctx, connectivity.Connecting); !ok {
+		t.Fatal("ClientConn is still in CONNECTING state when the context times out.")
+	}
 	if s := cc.GetState(); s != connectivity.TransientFailure {
 		t.Fatalf("ClientConn is in %v state, want TRANSIENT FAILURE", s)
 	}
@@ -234,6 +240,12 @@ func TestHealthCheckHealthServerNotRegistered(t *testing.T) {
 
 	if ok := cc.WaitForStateChange(ctx, connectivity.Idle); !ok {
 		t.Fatal("ClientConn is still in IDLE state when the context times out.")
+	}
+	if ok := cc.WaitForStateChange(ctx, connectivity.Connecting); !ok {
+		t.Fatal("ClientConn is still in CONNECTING state when the context times out.")
+	}
+	if ok := cc.WaitForStateChange(ctx, connectivity.Ready); !ok {
+		t.Fatal("ClientConn is still in READY state when the context times out.")
 	}
 	if ok := cc.WaitForStateChange(ctx, connectivity.Connecting); !ok {
 		t.Fatal("ClientConn is still in CONNECTING state when the context times out.")
