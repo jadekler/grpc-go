@@ -177,7 +177,6 @@ func TestDialWaitsForServerSettings(t *testing.T) {
 		t.Fatalf("Dial returned before server settings were sent")
 	}
 	<-done
-
 }
 
 func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
@@ -201,7 +200,8 @@ func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 			defer conn.Close()
 		}
 	}()
-	getMinConnectTimeout = func() time.Duration { return time.Second / 2 }
+	cleanup := setMinConnectTimeout(time.Second / 2)
+	defer cleanup()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	client, err := DialContext(ctx, lis.Addr().String(), WithInsecure(), WithWaitForHandshake(), WithBlock())
@@ -220,16 +220,14 @@ func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 }
 
 func TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
+	defer leakcheck.Check(t)
+
 	// 1. Client connects to a server that doesn't send preface.
 	// 2. After minConnectTimeout(500 ms here), client disconnects and retries.
 	// 3. The new server sends its preface.
 	// 4. Client doesn't kill the connection this time.
-	mctBkp := getMinConnectTimeout()
-	defer func() {
-		atomic.StoreInt64((*int64)(&mutableMinConnectTimeout), int64(mctBkp))
-	}()
-	defer leakcheck.Check(t)
-	atomic.StoreInt64((*int64)(&mutableMinConnectTimeout), int64(time.Millisecond)*500)
+	cleanup := setMinConnectTimeout(500 * time.Millisecond)
+	defer cleanup()
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
@@ -833,4 +831,13 @@ func TestBackoffCancel(t *testing.T) {
 	<-dialStrCh
 	cc.Close()
 	// Should not leak. May need -count 5000 to exercise.
+}
+
+// Set the minConnectTimeout. Be sure to defer cleanup!
+func setMinConnectTimeout(newMin time.Duration) (cleanup func()) {
+	mctBkp := getMinConnectTimeout()
+	atomic.StoreInt64((*int64)(&mutableMinConnectTimeout), int64(newMin))
+	return func() {
+		atomic.StoreInt64((*int64)(&mutableMinConnectTimeout), int64(mctBkp))
+	}
 }
